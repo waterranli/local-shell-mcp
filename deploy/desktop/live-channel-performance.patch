@@ -1,0 +1,31 @@
+--- a/src/local_shell_mcp/live_channel.py
++++ b/src/local_shell_mcp/live_channel.py
+@@ -192,14 +192,14 @@
+     def _prune_locked(self, now: float | None = None) -> None:
+         current = time.time() if now is None else now
+         self._prune_credentials_locked(current)
++        credential_live_ids = {
++            credential["live_id"] for credential in self._credentials.values()
++        }
+         expired = [
+             live_id
+             for live_id, channel in self._channels.items()
+             if channel.expires_at <= current
+-            or not any(
+-                credential["live_id"] == live_id
+-                for credential in self._credentials.values()
+-            )
++            or live_id not in credential_live_ids
+         ]
+         for live_id in expired:
+             self._channels.pop(live_id, None)
+@@ -391,7 +391,8 @@
+         digest = self._digest(token)
+         now = time.time()
+         with self._lock:
+-            self._prune_locked(now)
++            # Authentication only needs this credential. Registry maintenance is
++            # performed by open and channel lookups; never scan it per request.
+             credential = self._credentials.get(digest)
+             if credential is None or float(credential["expires_at"]) <= now:
+                 return None

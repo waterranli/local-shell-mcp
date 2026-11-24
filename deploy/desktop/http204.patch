@@ -1,0 +1,20 @@
+--- a/src/local_shell_mcp/auth.py
++++ b/src/local_shell_mcp/auth.py
+@@ -9,7 +9,7 @@
+ 
+ import jwt
+ from fastapi import HTTPException, Request
+-from starlette.responses import JSONResponse
++from starlette.responses import JSONResponse, Response
+ from starlette.types import ASGIApp, Message, Receive, Scope, Send
+ 
+ from .audit import audit
+@@ -531,7 +531,7 @@
+             return
+         headers = {key.lower(): value for key, value in scope.get("headers", [])}
+         if scope.get("method", "").upper() == "OPTIONS" and b"origin" in headers:
+-            response = JSONResponse({}, status_code=204, headers={
++            response = Response(status_code=204, headers={
+                 "Access-Control-Allow-Origin": "*",
+                 "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                 "Access-Control-Allow-Headers": "Authorization, Content-Type",
