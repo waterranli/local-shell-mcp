@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,9 +11,73 @@ from local_shell_mcp import browser_sessions
 from local_shell_mcp.browser_sessions import (
     BrowserSessionManager,
     BrowserSessionState,
+    close_browser_session_managers,
     get_browser_session_manager,
 )
 from local_shell_mcp.settings import get_settings
+
+
+def _stub_browser(monkeypatch):
+    calls = []
+    closed = asyncio.Event()
+
+    class Page:
+        url = "about:blank"
+
+        def is_closed(self):
+            return False
+
+        def on(self, *_args):
+            pass
+
+        async def title(self):
+            return "Synthetic idle test"
+
+    class Context:
+        def __init__(self):
+            self.pages = []
+
+        async def new_page(self):
+            page = Page()
+            self.pages.append(page)
+            return page
+
+        async def close(self):
+            calls.append("context")
+
+    class Browser:
+        async def new_context(self, **_kwargs):
+            return Context()
+
+        async def close(self):
+            calls.append("browser")
+
+    class BrowserType:
+        async def launch(self, **_kwargs):
+            return Browser()
+
+    class Playwright:
+        chromium = BrowserType()
+
+        async def stop(self):
+            calls.append("playwright")
+            closed.set()
+
+    class Starter:
+        async def start(self):
+            return Playwright()
+
+    monkeypatch.setattr("playwright.async_api.async_playwright", lambda: Starter())
+    monkeypatch.setattr(browser_sessions, "_CLEANUP_INTERVAL_S", 0.01)
+    return SimpleNamespace(calls=calls, closed=closed)
+
+
+async def _eventually(predicate):
+    async def wait():
+        while not predicate():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait(), timeout=1)
 
 
 def _chromium_installed() -> bool:
@@ -704,3 +769,262 @@ async def test_start_failure_stops_playwright(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="launch failed"):
         await manager.start()
     assert stopped["value"] is True
+
+
+@pytest.mark.asyncio
+async def test_idle_session_closes_without_another_browser_call(tmp_path, monkeypatch):
+    browser = _stub_browser(monkeypatch)
+    clock = [1000.0]
+    monkeypatch.setattr(browser_sessions.time, "time", lambda: clock[0])
+    manager = BrowserSessionManager(tmp_path / ".state")
+    try:
+        await manager.start()
+        cleanup_task = manager._cleanup_task
+        assert cleanup_task is not None
+        clock[0] += browser_sessions._IDLE_TIMEOUT_S + 1
+        # No list/snapshot/act/cleanup call triggers this close.
+        await asyncio.wait_for(browser.closed.wait(), timeout=1)
+        await asyncio.wait_for(cleanup_task, timeout=1)
+        assert browser.calls == ["context", "browser", "playwright"]
+        assert manager._sessions == {}
+        assert manager._cleanup_task is None
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_task_is_lazy_unique_and_restarts_after_empty(tmp_path, monkeypatch):
+    browser = _stub_browser(monkeypatch)
+    manager = BrowserSessionManager(tmp_path / ".state")
+    assert manager._cleanup_task is None
+    try:
+        first, second = await asyncio.gather(manager.start(), manager.start())
+        cleanup_task = manager._cleanup_task
+        assert cleanup_task is not None
+        await manager.close(first["session_id"])
+        assert manager._cleanup_task is cleanup_task
+        await manager.close(second["session_id"])
+        await asyncio.wait_for(cleanup_task, timeout=1)
+        assert manager._cleanup_task is None
+        third = await manager.start()
+        assert manager._cleanup_task is not None
+        assert manager._cleanup_task is not cleanup_task
+        assert len(browser.calls) == 6
+        await manager.close(third["session_id"])
+        await _eventually(lambda: manager._cleanup_task is None)
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.parametrize("operation", ["snapshot", "act"])
+@pytest.mark.asyncio
+async def test_idle_cleanup_protects_running_and_queued_operations(
+    tmp_path, monkeypatch, operation
+):
+    browser = _stub_browser(monkeypatch)
+    clock = [1000.0]
+    monkeypatch.setattr(browser_sessions.time, "time", lambda: clock[0])
+    manager = BrowserSessionManager(tmp_path / ".state")
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def capture(*_args):
+        entered.set()
+        await release.wait()
+        return []
+
+    async def action(_session, page, *_args):
+        entered.set()
+        await release.wait()
+        return {}, page
+
+    monkeypatch.setattr(manager, "_capture_interactive_elements", capture)
+    monkeypatch.setattr(manager, "_run_action", action)
+    tasks = []
+    try:
+        started = await manager.start()
+        session_id = started["session_id"]
+        state = manager._sessions[session_id]
+
+        def invoke():
+            if operation == "snapshot":
+                return manager.snapshot(session_id, include_text=False, screenshot=False)
+            return manager.act(session_id, [{"action": "wait"}])
+
+        tasks.append(asyncio.create_task(invoke()))
+        await entered.wait()
+        tasks.append(asyncio.create_task(invoke()))
+        await _eventually(lambda: state.active_operations == 2)
+        clock[0] += browser_sessions._IDLE_TIMEOUT_S + 1
+        await asyncio.sleep(0.04)
+        assert not browser.closed.is_set()
+        assert state.active_operations == 2
+        release.set()
+        await asyncio.gather(*tasks)
+        assert state.active_operations == 0
+        assert state.last_used_at == clock[0]
+        await asyncio.sleep(0.04)
+        assert not browser.closed.is_set()
+        clock[0] += browser_sessions._IDLE_TIMEOUT_S + 1
+        await asyncio.wait_for(browser.closed.wait(), timeout=1)
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_idle_cleanup_protects_registered_start_until_summary_finishes(tmp_path, monkeypatch):
+    browser = _stub_browser(monkeypatch)
+    clock = [1000.0]
+    monkeypatch.setattr(browser_sessions.time, "time", lambda: clock[0])
+    manager = BrowserSessionManager(tmp_path / ".state")
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_summary = manager._session_summary
+
+    async def summary(session, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original_summary(session, **kwargs)
+
+    monkeypatch.setattr(manager, "_session_summary", summary)
+    start = asyncio.create_task(manager.start())
+    try:
+        await entered.wait()
+        clock[0] += browser_sessions._IDLE_TIMEOUT_S + 1
+        await asyncio.sleep(0.04)
+        assert not browser.closed.is_set()
+        release.set()
+        started = await start
+        assert manager._sessions[started["session_id"]].last_used_at == clock[0]
+        await asyncio.sleep(0.04)
+        assert not browser.closed.is_set()
+    finally:
+        release.set()
+        await asyncio.gather(start, return_exceptions=True)
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_cleanup_retries_a_failed_explicit_close(tmp_path, monkeypatch):
+    browser = _stub_browser(monkeypatch)
+    manager = BrowserSessionManager(tmp_path / ".state")
+    original_close = manager._close_state
+    attempts = []
+
+    async def fail_once(session):
+        attempts.append(session.session_id)
+        if len(attempts) == 1:
+            raise RuntimeError("transient close failure")
+        await original_close(session)
+
+    monkeypatch.setattr(manager, "_close_state", fail_once)
+    try:
+        started = await manager.start()
+        with pytest.raises(RuntimeError, match="transient close failure"):
+            await manager.close(started["session_id"])
+        assert started["session_id"] in manager._cleanup_pending
+        await asyncio.wait_for(browser.closed.wait(), timeout=1)
+        await _eventually(lambda: manager._cleanup_task is None)
+        assert attempts == [started["session_id"], started["session_id"]]
+        assert manager._cleanup_pending == {}
+        assert browser.calls == ["context", "browser", "playwright"]
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_aclose_waits_for_busy_session_and_is_idempotent(tmp_path, monkeypatch):
+    browser = _stub_browser(monkeypatch)
+    manager = BrowserSessionManager(tmp_path / ".state")
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def action(_session, page, *_args):
+        entered.set()
+        await release.wait()
+        return {}, page
+
+    monkeypatch.setattr(manager, "_run_action", action)
+    started = await manager.start()
+    active = asyncio.create_task(manager.act(started["session_id"], [{"action": "wait"}]))
+    await entered.wait()
+    shutdown = asyncio.create_task(manager.aclose())
+    try:
+        await _eventually(lambda: manager._closed)
+        assert not shutdown.done()
+        assert not browser.closed.is_set()
+        with pytest.raises(RuntimeError, match="manager is closed"):
+            await manager.start()
+        release.set()
+        await active
+        await asyncio.wait_for(shutdown, timeout=1)
+        await manager.aclose()
+        assert manager._cleanup_task is None
+        assert browser.calls == ["context", "browser", "playwright"]
+    finally:
+        release.set()
+        await asyncio.gather(active, shutdown, return_exceptions=True)
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_aclose_rejects_an_inflight_launch_before_registration(tmp_path, monkeypatch):
+    browser = _stub_browser(monkeypatch)
+    manager = BrowserSessionManager(tmp_path / ".state")
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_page = manager._ensure_page
+
+    async def page(session):
+        entered.set()
+        await release.wait()
+        return await original_page(session)
+
+    monkeypatch.setattr(manager, "_ensure_page", page)
+    start = asyncio.create_task(manager.start())
+    await entered.wait()
+    shutdown = asyncio.create_task(manager.aclose())
+    try:
+        await _eventually(lambda: manager._closed)
+        assert not shutdown.done()
+        release.set()
+        with pytest.raises(RuntimeError, match="manager is closed"):
+            await start
+        await asyncio.wait_for(shutdown, timeout=1)
+        assert manager._sessions == {}
+        assert manager._starting_sessions == 0
+        assert browser.calls == ["context", "browser", "playwright"]
+    finally:
+        release.set()
+        await asyncio.gather(start, shutdown, return_exceptions=True)
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_close_all_managers_attempts_other_owners_and_preserves_failures(tmp_path, monkeypatch):
+    monkeypatch.setattr(browser_sessions, "_BROWSER_MANAGERS", {})
+    first = get_browser_session_manager(tmp_path / "first")
+    second = get_browser_session_manager(tmp_path / "second")
+    calls = []
+
+    async def failed_close():
+        calls.append("first-failed")
+        raise RuntimeError("close failure")
+
+    async def successful_close():
+        calls.append("second")
+
+    monkeypatch.setattr(first, "aclose", failed_close)
+    monkeypatch.setattr(second, "aclose", successful_close)
+    with pytest.raises(RuntimeError, match="close failure"):
+        await close_browser_session_managers()
+    assert calls == ["first-failed", "second"]
+    assert list(browser_sessions._BROWSER_MANAGERS.values()) == [first]
+
+    async def retry():
+        calls.append("first-retried")
+
+    monkeypatch.setattr(first, "aclose", retry)
+    await close_browser_session_managers()
+    assert browser_sessions._BROWSER_MANAGERS == {}
+    replacement = get_browser_session_manager(tmp_path / "first")
+    assert replacement is not first
+    await close_browser_session_managers()

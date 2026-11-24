@@ -30,7 +30,7 @@ from typing import Any
 
 from . import __version__
 from .audit import audit, suppress_audit
-from .browser_sessions import get_browser_session_manager
+from .browser_sessions import close_browser_session_managers, get_browser_session_manager
 from .errors import (
     PathNotFoundError,
     ShellExecutableNotFoundError,
@@ -3054,6 +3054,7 @@ async def _upgrade_worker_runtime(server: str, target_version: str) -> None:
         file=sys.stderr,
         flush=True,
     )
+    await close_browser_session_managers()
     _reexec_updated_worker_runtime()
 
 
@@ -3926,7 +3927,10 @@ async def run_worker(
     from .remote_worker_service import worker_run_lock
 
     with worker_run_lock(), suppress_audit_archives():
-        await _run_worker_locked(server, invite, name, workdir, persist)
+        try:
+            await _run_worker_locked(server, invite, name, workdir, persist)
+        finally:
+            await close_browser_session_managers()
 
 
 async def _run_worker_locked(

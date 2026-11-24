@@ -8,8 +8,8 @@ import json
 import subprocess
 import time
 import uuid
-from collections.abc import Awaitable, Callable
-from contextlib import suppress
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import urlparse
@@ -18,11 +18,12 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, Icon, ImageContent, TextContent, ToolAnnotations
 from pathspec.gitignore import GitIgnoreSpec
 from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
+from starlette.applications import Starlette
 
 from . import __version__
 from .audit import audit, audit_call_context, audit_result_ok
 from .auth import current_principal, principal_scopes, require_current_scopes
-from .browser_sessions import get_browser_session_manager
+from .browser_sessions import close_browser_session_managers, get_browser_session_manager
 from .command_preflight import CommandPreflightDecision, preflight_command
 from .deprecated_tools import DeprecatedToolFastMCP as FastMCP
 from .downloads import create_share_link, list_share_links, revoke_share_link
@@ -4909,9 +4910,37 @@ def _register_live_workspace_tools(
         )
 
 
+class _BrowserLifecycleFastMCP(FastMCP):
+    """The CLI owns one server per process; clients do not own browser managers."""
+
+    async def run_stdio_async(self) -> None:
+        try:
+            await super().run_stdio_async()
+        finally:
+            await close_browser_session_managers()
+
+    def streamable_http_app(self) -> Starlette:
+        app = super().streamable_http_app()
+        original_lifespan = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def lifespan(application: Starlette) -> AsyncIterator[Any]:
+            started = False
+            try:
+                async with original_lifespan(application) as state:
+                    started = True
+                    yield state
+            finally:
+                if started:
+                    await close_browser_session_managers()
+
+        app.router.lifespan_context = lifespan
+        return app
+
+
 def build_mcp() -> FastMCP:
     settings = get_settings()
-    mcp = FastMCP(
+    mcp = _BrowserLifecycleFastMCP(
         "local-shell-mcp",
         instructions=(
             MCP_INSTRUCTIONS if settings.logical_sessions_enabled else MCP_BASE_INSTRUCTIONS

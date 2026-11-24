@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import re
 import time
 import uuid
@@ -14,6 +15,7 @@ from .fs_ops import relative_display, resolve_path
 
 _MAX_SESSIONS = 8
 _IDLE_TIMEOUT_S = 3600
+_CLEANUP_INTERVAL_S = 60
 _MAX_ACTIONS = 50
 _MAX_SNAPSHOT_ELEMENTS = 200
 _MAX_SNAPSHOT_TEXT_CHARS = 100_000
@@ -22,6 +24,13 @@ _MAX_BROWSER_ARTIFACT_FILES = 100
 _MAX_BROWSER_ARTIFACT_BYTES = 512 * 1024 * 1024
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 _REF_ATTRIBUTE = "data-local-shell-mcp-ref"
+_LOGGER = logging.getLogger(__name__)
+
+
+def _set_event() -> asyncio.Event:
+    event = asyncio.Event()
+    event.set()
+    return event
 
 
 @dataclass(slots=True)
@@ -45,6 +54,9 @@ class BrowserSessionState:
     errors: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=100))
     network: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=100))
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    active_operations: int = 0
+    operations_idle: asyncio.Event = field(default_factory=_set_event)
+    close_finished: asyncio.Event = field(default_factory=_set_event)
 
 
 class BrowserSessionManager:
@@ -62,6 +74,102 @@ class BrowserSessionManager:
         self._starting_sessions = 0
         self._lock = asyncio.Lock()
         self._artifact_lock = asyncio.Lock()
+        self._cleanup_task: asyncio.Task[None] | None = None
+        self._cleanup_wakeup = asyncio.Event()
+        self._starts_finished = _set_event()
+        self._shutdown_lock = asyncio.Lock()
+        self._closed = False
+
+    def _has_resources_locked(self) -> bool:
+        return bool(
+            self._sessions
+            or self._cleanup_pending
+            or self._closing_sessions
+            or self._starting_sessions
+        )
+
+    def _ensure_cleanup_task_locked(self) -> None:
+        if self._closed or not self._has_resources_locked():
+            return
+        if self._cleanup_task is None or self._cleanup_task.done():
+            self._cleanup_wakeup.clear()
+            self._cleanup_task = asyncio.create_task(
+                self._cleanup_loop(), name="local-shell-mcp-browser-idle-cleanup"
+            )
+
+    def _wake_cleanup_if_empty_locked(self) -> None:
+        if not self._has_resources_locked():
+            self._cleanup_wakeup.set()
+
+    async def _cleanup_loop(self) -> None:
+        task = asyncio.current_task()
+        try:
+            while True:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._cleanup_wakeup.wait(), timeout=_CLEANUP_INTERVAL_S
+                    )
+                self._cleanup_wakeup.clear()
+                async with self._lock:
+                    if self._closed or not self._has_resources_locked():
+                        # Clear under the same lock used by start, so a concurrent
+                        # new session cannot miss starting its own cleanup task.
+                        if self._cleanup_task is task:
+                            self._cleanup_task = None
+                        return
+                try:
+                    await self._cleanup_idle(retry_pending=True)
+                except Exception:
+                    _LOGGER.exception("Automatic browser cleanup failed")
+        finally:
+            async with self._lock:
+                if self._cleanup_task is task:
+                    self._cleanup_task = None
+
+    @staticmethod
+    def _begin_operation_locked(session: BrowserSessionState) -> None:
+        session.active_operations += 1
+        session.operations_idle.clear()
+
+    async def _finish_operations(
+        self, sessions: list[BrowserSessionState], *, touch: bool = True
+    ) -> None:
+        async with self._lock:
+            for session in sessions:
+                if touch:
+                    session.last_used_at = time.time()
+                session.active_operations -= 1
+                if not session.active_operations:
+                    session.operations_idle.set()
+
+    @contextlib.asynccontextmanager
+    async def _session_operation(self, session_id: str):  # noqa: ANN202
+        session = await self._get_session(session_id, pin=True)
+        try:
+            async with session.lock:
+                yield session
+        finally:
+            await self._finish_operations([session])
+
+    async def aclose(self) -> None:
+        """Stop maintenance and release every browser owned by this manager."""
+
+        async with self._shutdown_lock:
+            async with self._lock:
+                self._closed = True
+                task = self._cleanup_task
+                self._cleanup_task = None
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await self._starts_finished.wait()
+            while True:
+                async with self._lock:
+                    closing = list(self._closing_sessions.values())
+                if not closing:
+                    break
+                await asyncio.gather(*(session.close_finished.wait() for session in closing))
+            await self._cleanup_idle(force=True)
 
     async def manage(
         self,
@@ -95,10 +203,16 @@ class BrowserSessionManager:
             async with self._lock:
                 sessions = list(self._sessions.values())
                 cleanup_pending = sorted(self._cleanup_pending.keys() | self._closing_sessions.keys())
-            return {
-                "sessions": [await self._session_summary(item) for item in sessions],
-                "cleanup_pending": cleanup_pending,
-            }
+                for session in sessions:
+                    self._begin_operation_locked(session)
+            try:
+                summaries = []
+                for session in sessions:
+                    async with session.lock:
+                        summaries.append(await self._session_summary(session))
+                return {"sessions": summaries, "cleanup_pending": cleanup_pending}
+            finally:
+                await self._finish_operations(sessions, touch=False)
         if action == "close":
             if not session_id:
                 raise ValueError("session_id is required for action=close")
@@ -134,6 +248,8 @@ class BrowserSessionManager:
 
         await self._cleanup_idle()
         async with self._lock:
+            if self._closed:
+                raise RuntimeError("browser session manager is closed")
             if (
                 len(self._sessions)
                 + len(self._cleanup_pending)
@@ -143,6 +259,7 @@ class BrowserSessionManager:
             ):
                 raise ValueError(f"at most {_MAX_SESSIONS} browser sessions may be active")
             self._starting_sessions += 1
+            self._starts_finished.clear()
         slot_reserved = True
 
         playwright = None
@@ -189,16 +306,29 @@ class BrowserSessionManager:
             if url:
                 await page_state.page.goto(url, wait_until=wait_until, timeout=60_000)
             async with self._lock:
+                if self._closed:
+                    raise RuntimeError("browser session manager is closed")
+                self._begin_operation_locked(session)
                 self._sessions[session.session_id] = session
                 self._starting_sessions -= 1
+                if not self._starting_sessions:
+                    self._starts_finished.set()
                 slot_reserved = False
                 inserted = True
-            return await self._session_summary(session, current_page_id=page_state.page_id)
+                self._ensure_cleanup_task_locked()
+            try:
+                return await self._session_summary(session, current_page_id=page_state.page_id)
+            finally:
+                await self._finish_operations([session])
         except (Exception, asyncio.CancelledError):
             if inserted and session is not None:
-                async with self._lock:
-                    self._sessions.pop(session.session_id, None)
-            if session is not None:
+                with contextlib.suppress(Exception):
+                    try:
+                        await self.close(session.session_id)
+                    except ValueError:
+                        # Shutdown may already own this registered session.
+                        await session.close_finished.wait()
+            elif session is not None:
                 with contextlib.suppress(Exception):
                     await self._close_state(session)
             else:
@@ -216,6 +346,9 @@ class BrowserSessionManager:
             if slot_reserved:
                 async with self._lock:
                     self._starting_sessions -= 1
+                    if not self._starting_sessions:
+                        self._starts_finished.set()
+                    self._wake_cleanup_if_empty_locked()
 
     async def close(
         self, session_id: str, *, save_storage_state_path: str | None = None
@@ -226,25 +359,31 @@ class BrowserSessionManager:
                 session = self._cleanup_pending.pop(session_id, None)
             if session is not None:
                 self._closing_sessions[session.session_id] = session
+                session.close_finished.clear()
         if session is None:
             raise ValueError(f"unknown browser session: {session_id}")
         save_error: BaseException | None = None
         try:
-            if save_storage_state_path:
-                target = resolve_path(save_storage_state_path)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                await session.context.storage_state(path=str(target))
-        except (Exception, asyncio.CancelledError) as exc:
-            save_error = exc
-        try:
+            await session.operations_idle.wait()
+            try:
+                if save_storage_state_path:
+                    target = resolve_path(save_storage_state_path)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    await session.context.storage_state(path=str(target))
+            except (Exception, asyncio.CancelledError) as exc:
+                save_error = exc
             await self._close_state(session)
         except (Exception, asyncio.CancelledError):
             async with self._lock:
                 self._closing_sessions.pop(session.session_id, None)
                 self._cleanup_pending.setdefault(session.session_id, session)
+                session.close_finished.set()
+                self._ensure_cleanup_task_locked()
             raise
         async with self._lock:
             self._closing_sessions.pop(session.session_id, None)
+            session.close_finished.set()
+            self._wake_cleanup_if_empty_locked()
         if save_error is not None:
             raise save_error
         result: dict[str, Any] = {"session_id": session_id, "closed": True}
@@ -263,8 +402,7 @@ class BrowserSessionManager:
         max_text_chars: int = _MAX_SNAPSHOT_TEXT_CHARS,
         max_elements: int = 100,
     ) -> dict[str, Any]:
-        session = await self._get_session(session_id)
-        async with session.lock:
+        async with self._session_operation(session_id) as session:
             page_state = await self._select_page(session, page_id)
             page = page_state.page
             session.last_used_at = time.time()
@@ -322,9 +460,8 @@ class BrowserSessionManager:
         if len(actions) > _MAX_ACTIONS:
             raise ValueError(f"actions may contain at most {_MAX_ACTIONS} entries")
         timeout_ms = max(1, min(int(timeout_ms), 120_000))
-        session = await self._get_session(session_id)
         results: list[dict[str, Any]] = []
-        async with session.lock:
+        async with self._session_operation(session_id) as session:
             current = await self._select_page(session, page_id)
             session.last_used_at = time.time()
             for index, raw_action in enumerate(actions):
@@ -475,10 +612,14 @@ class BrowserSessionManager:
         selector = page_state.refs.get(target, target)
         return page_state.page.locator(selector).first
 
-    async def _get_session(self, session_id: str) -> BrowserSessionState:
+    async def _get_session(self, session_id: str, *, pin: bool = False) -> BrowserSessionState:
         await self._cleanup_idle()
         async with self._lock:
+            if self._closed:
+                raise RuntimeError("browser session manager is closed")
             session = self._sessions.get(session_id)
+            if session is not None and pin:
+                self._begin_operation_locked(session)
         if session is None:
             raise ValueError(f"unknown browser session: {session_id}")
         return session
@@ -588,49 +729,66 @@ class BrowserSessionManager:
             )
         return rows
 
-    async def _cleanup_idle(self, *, force: bool = False) -> int:
+    async def _cleanup_idle(self, *, force: bool = False, retry_pending: bool = False) -> int:
         cutoff = time.time() - _IDLE_TIMEOUT_S
         async with self._lock:
             stale_ids = [
                 session_id
                 for session_id, state in self._sessions.items()
-                if force or state.last_used_at < cutoff
+                if (force or state.last_used_at < cutoff)
+                and (force or not state.active_operations)
             ]
             stale = [self._sessions.pop(session_id) for session_id in stale_ids]
-            pending = list(self._cleanup_pending.values()) if force else []
+            pending = [
+                session
+                for session in self._cleanup_pending.values()
+                if force or (retry_pending and not session.active_operations)
+            ]
             pending_ids = {session.session_id for session in pending}
-            if force:
-                self._cleanup_pending.clear()
+            for session in pending:
+                self._cleanup_pending.pop(session.session_id, None)
             candidates = stale + [
                 session for session in pending if session.session_id not in stale_ids
             ]
             for session in candidates:
                 self._closing_sessions[session.session_id] = session
+                session.close_finished.clear()
         closed = 0
         first_error: Exception | None = None
         for index, session in enumerate(candidates):
             try:
+                await session.operations_idle.wait()
                 await self._close_state(session)
             except asyncio.CancelledError:
                 async with self._lock:
                     self._closing_sessions.pop(session.session_id, None)
                     self._cleanup_pending.setdefault(session.session_id, session)
+                    session.close_finished.set()
                     for remaining in candidates[index + 1 :]:
                         self._closing_sessions.pop(remaining.session_id, None)
+                        remaining.close_finished.set()
                         if remaining.session_id in pending_ids:
                             self._cleanup_pending.setdefault(remaining.session_id, remaining)
                         else:
                             self._sessions.setdefault(remaining.session_id, remaining)
+                    self._ensure_cleanup_task_locked()
                 raise
             except Exception as exc:
                 async with self._lock:
                     self._closing_sessions.pop(session.session_id, None)
                     self._cleanup_pending.setdefault(session.session_id, session)
+                    session.close_finished.set()
+                    self._ensure_cleanup_task_locked()
+                _LOGGER.warning(
+                    "Browser cleanup failed (%s); retaining it for retry", type(exc).__name__
+                )
                 if first_error is None:
                     first_error = exc
             else:
                 async with self._lock:
                     self._closing_sessions.pop(session.session_id, None)
+                    session.close_finished.set()
+                    self._wake_cleanup_if_empty_locked()
                 closed += 1
         if force and first_error is not None:
             raise first_error
@@ -682,7 +840,24 @@ _BROWSER_MANAGERS: dict[str, BrowserSessionManager] = {}
 def get_browser_session_manager(state_dir: Path) -> BrowserSessionManager:
     key = str(Path(state_dir).resolve())
     manager = _BROWSER_MANAGERS.get(key)
-    if manager is None:
+    if manager is None or (manager._closed and not manager._has_resources_locked()):
         manager = BrowserSessionManager(Path(state_dir))
         _BROWSER_MANAGERS[key] = manager
     return manager
+
+
+async def close_browser_session_managers() -> None:
+    """Close every cached manager, attempting all owners before reporting a failure."""
+
+    first_error: Exception | None = None
+    for key, manager in list(_BROWSER_MANAGERS.items()):
+        try:
+            await manager.aclose()
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+        else:
+            if _BROWSER_MANAGERS.get(key) is manager:
+                _BROWSER_MANAGERS.pop(key, None)
+    if first_error is not None:
+        raise first_error

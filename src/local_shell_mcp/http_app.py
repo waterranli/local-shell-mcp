@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -16,6 +18,7 @@ from .auth import (
     required_scopes_for_http_tool,
     verify_request,
 )
+from .browser_sessions import close_browser_session_managers
 from .downloads import (
     create_download_link,
     download_endpoint,
@@ -429,6 +432,21 @@ def _register_browser_routes(app: FastAPI) -> None:
 
 def build_http_app() -> FastAPI:
     app = FastAPI(title="local-shell-mcp REST API", version="0.1.0")
+    original_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI) -> AsyncIterator[Any]:
+        started = False
+        try:
+            async with original_lifespan(application) as state:
+                started = True
+                yield state
+        finally:
+            # As with the MCP CLI, this application owns the process managers.
+            if started:
+                await close_browser_session_managers()
+
+    app.router.lifespan_context = lifespan
     settings = get_settings()
     if settings.auth_mode != "none":
         app.add_middleware(CloudflareAccessMiddleware)
