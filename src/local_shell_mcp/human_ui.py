@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import copy
 import ipaddress
 import json
 import logging
@@ -16,7 +17,10 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from urllib.parse import urlsplit
@@ -89,6 +93,143 @@ _PROCESS_STARTED_AT = time.time()
 _SYSTEM_SAMPLE_LOCK = threading.Lock()
 _CPU_SAMPLE: tuple[int, int] | None = None
 _NETWORK_SAMPLE: tuple[float, int, int] | None = None
+
+_UI_STATUS_TTL_S = 5.0
+_UI_STATUS_FAILURE_TTL_S = 1.5
+_UI_STATUS_MAX_ENTRIES = 128
+_UI_STATUS_TOOLS = frozenset({"shell_list", "job_list"})
+_UI_STATUS_MUTATIONS = frozenset({"shell_start", "shell_kill", "job_start", "job_stop", "job_retry"})
+
+
+@dataclass(slots=True)
+class _UIStatusEntry:
+    task: asyncio.Task[None] | None = None
+    value: Any = None
+    error: Exception | None = None
+    expires_at: float = 0.0
+    invalidated: bool = False
+
+
+_UI_STATUS_CACHES: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, OrderedDict[tuple[Any, ...], _UIStatusEntry]
+] = weakref.WeakKeyDictionary()
+_UI_STATUS_CACHES_LOCK = threading.Lock()
+
+
+def _ui_status_now() -> float:
+    return time.monotonic()
+
+
+def _ui_status_entries() -> OrderedDict[tuple[Any, ...], _UIStatusEntry]:
+    loop = asyncio.get_running_loop()
+    with _UI_STATUS_CACHES_LOCK:
+        return _UI_STATUS_CACHES.setdefault(loop, OrderedDict())
+
+
+def _copy_ui_status_error(error: Exception) -> Exception:
+    # Never retain a request/fetch traceback or mutate a shared cached exception.
+    try:
+        cloned = copy.copy(error)
+    except Exception:
+        cloned = RuntimeError(str(error))
+    cloned.__traceback__ = None
+    cloned.__cause__ = None
+    cloned.__context__ = None
+    return cloned
+
+
+def _invalidate_ui_status(machine: str) -> None:
+    with _UI_STATUS_CACHES_LOCK:
+        entries = _UI_STATUS_CACHES.get(asyncio.get_running_loop())
+    if entries is None:
+        return
+    for key, entry in list(entries.items()):
+        if key[0] == machine:
+            if entry.error is not None and entry.expires_at > _ui_status_now():
+                continue
+            entry.invalidated = True
+            if entry.task is None:
+                entries.pop(key, None)
+
+
+async def _ui_status_snapshot(
+    request: Request,
+    machine: str,
+    local_call: Callable[[], Any | Awaitable[Any]],
+    remote_tool: str,
+    remote_args: dict[str, Any],
+) -> Any:
+    """Coalesce UI status polls only; terminal attachment and tools stay fresh."""
+    _require_ui_scopes(request, "shell:read", machine=machine)
+    if remote_tool not in _UI_STATUS_TOOLS:
+        raise ValueError("Only terminal and job status can use the UI status cache")
+    principal = _request_principal(request)
+    key = (
+        machine,
+        remote_tool,
+        json.dumps(remote_args, sort_keys=True, separators=(",", ":")),
+        principal.subject,
+        principal.email,
+        str(principal.claims.get("auth") or ""),
+        tuple(sorted(principal_scopes(principal))),
+        live_id_from_claims(principal.claims),
+        str(get_settings().state_dir),
+    )
+    entries = _ui_status_entries()
+
+    async def fetch(entry: _UIStatusEntry) -> None:
+        try:
+            entry.value = copy.deepcopy(
+                await _machine_dispatch(machine, local_call, remote_tool, remote_args)
+            )
+            entry.expires_at = _ui_status_now() + _UI_STATUS_TTL_S
+        except Exception as exc:
+            entry.error = _copy_ui_status_error(exc)
+            entry.expires_at = _ui_status_now() + _UI_STATUS_FAILURE_TTL_S
+            entry.invalidated = False
+        except BaseException:
+            if entries.get(key) is entry:
+                entries.pop(key, None)
+            raise
+        finally:
+            # Completed entries must not keep tasks (and their event loop) alive.
+            entry.task = None
+
+    refreshes_after_mutation = 0
+    while True:
+        now = _ui_status_now()
+        for old_key, old in list(entries.items()):
+            if old.task is None and (old.invalidated or old.expires_at <= now):
+                entries.pop(old_key, None)
+        entry = entries.get(key)
+        if entry is None:
+            if len(entries) >= _UI_STATUS_MAX_ENTRIES:
+                oldest = next((k for k, e in entries.items() if e.task is None), None)
+                if oldest is None:
+                    raise HTTPException(503, "Too many pending UI status refreshes")
+                entries.pop(oldest)
+            entry = _UIStatusEntry()
+            entries[key] = entry
+            task = asyncio.create_task(fetch(entry), name="ui-status-refresh")
+            if not task.done():
+                entry.task = task
+        entries.move_to_end(key)
+        if entry.task is not None:
+            await asyncio.shield(entry.task)
+        if entry.error is not None:
+            raise _copy_ui_status_error(entry.error)
+        if entry.invalidated:
+            # Join a raced fetch, then refresh once. Continuous mutations must
+            # not keep a UI request (or failed-status retries) alive forever.
+            if refreshes_after_mutation:
+                entry.error = HTTPException(503, "Status changed during refresh; retry shortly")
+                entry.value = None
+                entry.expires_at = _ui_status_now() + _UI_STATUS_FAILURE_TTL_S
+                entry.invalidated = False
+                raise _copy_ui_status_error(entry.error)
+            refreshes_after_mutation += 1
+            continue
+        return copy.deepcopy(entry.value)
 
 
 def _read_linux_cpu_times() -> tuple[int, int] | None:
@@ -724,15 +865,22 @@ async def _machine_dispatch(
     remote_args: dict[str, Any],
     remote_timeout_s: int | None = None,
 ) -> Any:
-    if machine == "local":
-        if get_settings().disable_local:
-            raise RuntimeError("Local access is disabled")
-        with suppress_audit():
-            result = await asyncio.to_thread(local_call)
-            if asyncio.iscoroutine(result):
-                return await result
-            return result
-    return await _remote_call(machine, remote_tool, remote_args, remote_timeout_s)
+    mutation = remote_tool in _UI_STATUS_MUTATIONS
+    if mutation:
+        _invalidate_ui_status(machine)
+    try:
+        if machine == "local":
+            if get_settings().disable_local:
+                raise RuntimeError("Local access is disabled")
+            with suppress_audit():
+                result = await asyncio.to_thread(local_call)
+                if asyncio.iscoroutine(result):
+                    return await result
+                return result
+        return await _remote_call(machine, remote_tool, remote_args, remote_timeout_s)
+    finally:
+        if mutation:
+            _invalidate_ui_status(machine)
 
 
 def _machine_uses_windows_paths(machine: str) -> bool:
@@ -825,7 +973,7 @@ async def api_dashboard(request: Request) -> Response:
     source_alerts: list[dict[str, Any]] = []
     with suppress_audit():
         try:
-            terminals = await _machine_dispatch(machine, list_shells, "shell_list", {})
+            terminals = await _ui_status_snapshot(request, machine, list_shells, "shell_list", {})
         except Exception as exc:
             _LOGGER.debug("Dashboard terminal snapshot failed", exc_info=True)
             terminals = {"sessions": []}
@@ -838,7 +986,8 @@ async def api_dashboard(request: Request) -> Response:
                 }
             )
         try:
-            jobs_payload = await _machine_dispatch(
+            jobs_payload = await _ui_status_snapshot(
+                request,
                 machine,
                 lambda: list_jobs(include_finished=True),
                 "job_list",
@@ -1349,7 +1498,7 @@ async def api_terminals(request: Request) -> Response:
     machine = request.query_params.get("machine", "local")
     try:
         _require_ui_scopes(request, "shell:read", machine=machine)
-        result = await _machine_dispatch(machine, list_shells, "shell_list", {})
+        result = await _ui_status_snapshot(request, machine, list_shells, "shell_list", {})
         return _json_ok({"machine": machine, **(result or {"sessions": []})})
     except Exception as exc:
         return _json_error(exc)
