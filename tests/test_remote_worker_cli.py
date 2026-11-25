@@ -269,6 +269,7 @@ async def test_run_worker_transfer_does_not_block_interactive_jobs(tmp_path, mon
 
     monkeypatch.setattr(cli.remote, "execute_worker_tool", fake_execute)
     monkeypatch.setattr(cli.remote, "_worker_post_json_forever", fake_post)
+    monkeypatch.setattr(cli.remote, "_worker_post_json_cancellable", fake_post)
 
     with pytest.raises(RuntimeError, match="stop polling"):
         await cli.remote.run_worker("https://example.test", "invite", workdir=str(tmp_path))

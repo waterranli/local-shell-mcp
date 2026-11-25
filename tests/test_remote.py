@@ -171,7 +171,8 @@ async def test_worker_job_outbox_sender_drains_and_accepts_persisted_result(
     accepted = asyncio.Event()
     submitted = []
 
-    async def submit(result, _server, _headers, _heartbeat_interval_s):
+    async def submit(result, _server, _headers, _heartbeat_interval_s, *, single_attempt):
+        assert single_attempt is True
         submitted.append(result)
         accepted.set()
         return {"ok": True, "data": {"accepted": True}}

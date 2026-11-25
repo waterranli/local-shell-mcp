@@ -101,7 +101,9 @@ REMOTE_API_PREFIX = "/remote"
 REMOTE_WORKER_BUNDLE_PATH = "/remote/worker-bundle.tgz"
 REMOTE_WORKER_LANE_PROTOCOL_VERSION = 3
 REMOTE_WORKER_RESET_PROTOCOL_VERSION = 4
-REMOTE_WORKER_POLL_PROTOCOL_VERSION = REMOTE_WORKER_RESET_PROTOCOL_VERSION
+# Revision 5 upgrades result delivery scheduling, without changing poll lanes or
+# reset payloads. Existing workers must fetch the updated runtime once.
+REMOTE_WORKER_POLL_PROTOCOL_VERSION = 5
 _WORKER_CONNECT_TIMEOUT_S = 10.0
 _WORKER_POLL_TIMEOUT_GRACE_S = 10.0
 _WORKER_TRANSFER_LEASE_REFRESH_INTERVAL_S = 60.0
@@ -3336,6 +3338,8 @@ _WORKER_RETRY_MAX_DELAY_S = 30.0
 _WORKER_RESULT_MIN_TIMEOUT_S = 30.0
 _WORKER_RESULT_TIMEOUT_GRACE_S = 15.0
 _WORKER_RESULT_MIN_UPLOAD_BYTES_PER_S = 16 * 1024
+_WORKER_OUTBOX_POLL_INTERVAL_S = 0.25
+_WORKER_OUTBOX_FRESH_BURST = 3
 
 
 def _worker_result_request_timeout_s(result: dict[str, Any]) -> float:
@@ -3660,10 +3664,15 @@ async def _submit_worker_result_with_heartbeat(
     heartbeat_interval_s: float,
     *,
     preserve_across_reset: bool = False,
+    single_attempt: bool = False,
 ) -> dict[str, Any]:
     result_timeout_s = _worker_result_request_timeout_s(result)
     submission = asyncio.create_task(
-        _worker_post_json_forever(
+        _worker_post_json_cancellable(
+            f"{server}{REMOTE_API_PREFIX}/result", result, headers, result_timeout_s
+        )
+        if single_attempt
+        else _worker_post_json_forever(
             f"{server}{REMOTE_API_PREFIX}/result",
             result,
             headers,
@@ -3715,6 +3724,102 @@ async def _submit_worker_result_with_heartbeat(
     finally:
         heartbeat.cancel()
         await asyncio.gather(heartbeat, return_exceptions=True)
+
+
+def _worker_result_acknowledged(response: Any) -> bool:
+    if not isinstance(response, dict) or response.get("ok") is False:
+        return False
+    data = response.get("data")
+    return isinstance(data, dict) and (
+        type(data.get("accepted")) is bool or data.get("cancelled") is True
+    )
+
+
+def _worker_outbox_inventory(
+    directory: Path, known: set[str]
+) -> tuple[list[Path], dict[str, float]]:
+    """Read immutable spool times once, outside the worker event loop."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    paths = list(directory.glob("*.json"))
+    discovered = {}
+    for path in paths:
+        if path.name in known:
+            continue
+        spooled_at = 0.0
+        try:
+            result = json.loads(path.read_text(encoding="utf-8"))
+            lifecycle = result.get("lifecycle") if isinstance(result, dict) else None
+            raw_time = lifecycle.get("result_spooled_at") if isinstance(lifecycle, dict) else None
+            if isinstance(raw_time, (int, float)) and math.isfinite(raw_time) and raw_time > 0:
+                spooled_at = float(raw_time)
+        except Exception:  # noqa: BLE001
+            # Malformed/unreadable entries still get a fair attempt and a retry
+            # cooldown; neither their contents nor their age causes deletion.
+            pass
+        discovered[path.name] = spooled_at
+    return paths, discovered
+
+
+@dataclass
+class _WorkerResultOutboxSchedule:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    spooled_at: dict[str, float] = field(default_factory=dict)
+    last_served: dict[str, int] = field(default_factory=dict)
+    attempts: dict[str, int] = field(default_factory=dict)
+    retry_at: dict[str, float] = field(default_factory=dict)
+    turn: int = 0
+    fresh_burst: int = 0
+
+    async def claim(self, directory: Path, in_progress: set[str]) -> Path | None:
+        async with self.lock:
+            paths, discovered = await asyncio.to_thread(
+                _worker_outbox_inventory, directory, set(self.spooled_at)
+            )
+            self.spooled_at.update(discovered)
+            for name in discovered:
+                self.last_served.setdefault(name, self.turn)
+            existing = {path.name for path in paths} | in_progress
+            for mapping in (self.spooled_at, self.last_served, self.attempts, self.retry_at):
+                for name in set(mapping) - existing:
+                    mapping.pop(name, None)
+            now = time.monotonic()
+            ready = [
+                path for path in paths
+                if path.name not in in_progress and self.retry_at.get(path.name, 0) <= now
+            ]
+            if not ready:
+                return None
+            cutoff = _utc() - REMOTE_RESULT_GRACE_S
+            fresh = [path for path in ready if self.spooled_at[path.name] >= cutoff]
+            backlog = [path for path in ready if self.spooled_at[path.name] < cutoff]
+            if backlog and (not fresh or self.fresh_burst >= _WORKER_OUTBOX_FRESH_BURST):
+                candidates = backlog
+                self.fresh_burst = 0
+            else:
+                candidates = fresh
+                self.fresh_burst = min(self.fresh_burst + 1, _WORKER_OUTBOX_FRESH_BURST)
+            # A shared service cursor rotates each class. Newly discovered
+            # entries start at this turn, so they cannot repeatedly jump ahead
+            # of an older retry. File mtime is never a priority input.
+            path = min(
+                candidates,
+                key=lambda item: (
+                    self.last_served[item.name], self.spooled_at[item.name], item.name
+                ),
+            )
+            self.turn += 1
+            self.last_served[path.name] = self.turn
+            in_progress.add(path.name)
+            return path
+
+    async def failed(self, name: str) -> float:
+        async with self.lock:
+            attempt = self.attempts.get(name, 0)
+            delay = _worker_retry_delay(attempt)
+            self.attempts[name] = attempt + 1
+            self.retry_at[name] = time.monotonic() + delay
+            return delay
 
 
 async def _run_worker_job(
@@ -3783,50 +3888,54 @@ async def _worker_result_outbox_sender(
     headers: dict[str, str],
     heartbeat_interval_s: float,
     in_progress: set[str],
+    schedule: _WorkerResultOutboxSchedule | None = None,
 ) -> None:
     directory = _worker_result_outbox_dir()
+    schedule = schedule or _WorkerResultOutboxSchedule()
     while True:
-        directory.mkdir(parents=True, exist_ok=True)
-        candidates = [path for path in sorted(directory.glob("*.json")) if path.name not in in_progress]
-        if not candidates:
-            await asyncio.sleep(0.25)
-            continue
-        path = candidates[0]
-        in_progress.add(path.name)
+        path = None
+        operation = "scan result outbox"
         try:
-            try:
-                result = json.loads(await asyncio.to_thread(path.read_text, encoding="utf-8"))
-                if not isinstance(result, dict):
-                    raise ValueError("spooled result is not a JSON object")
-            except Exception as exc:  # noqa: BLE001
-                _worker_log_retry("read result outbox", exc, 1.0)
-                await asyncio.sleep(1.0)
+            path = await schedule.claim(directory, in_progress)
+            if path is None:
+                await asyncio.sleep(_WORKER_OUTBOX_POLL_INTERVAL_S)
                 continue
+            operation = "read result outbox"
+            result = json.loads(await asyncio.to_thread(path.read_text, encoding="utf-8"))
+            if not isinstance(result, dict) or not result.get("job_id"):
+                raise ValueError("spooled result must be a JSON object with a job id")
             lifecycle = result.get("lifecycle")
-            if isinstance(lifecycle, dict):
+            if isinstance(lifecycle, dict) and "result_submit_started_at" not in lifecycle:
                 lifecycle["result_submit_started_at"] = _utc()
-                try:
-                    await asyncio.to_thread(_worker_store_result_outbox, result)
-                except Exception as exc:  # noqa: BLE001
-                    _worker_log_retry("update result outbox timing", exc, 1.0)
+                operation = "update result outbox timing"
+                await asyncio.to_thread(_worker_store_result_outbox, result)
+            operation = "result outbox submit"
             response = await _submit_worker_result_with_heartbeat(
                 result, server, headers, heartbeat_interval_s,
+                single_attempt=True,
                 **({"preserve_across_reset": True} if result.get("preserve_across_reset") else {}),
             )
-            data = response.get("data") if isinstance(response, dict) else None
+            if not _worker_result_acknowledged(response):
+                raise ValueError("controller did not acknowledge result delivery")
+            data = response["data"]
             # accepted=false means the controller already timed out/cancelled it,
             # or this is a harmless retry after an ACK was lost.
-            if isinstance(data, dict) and data.get("accepted") is False:
+            if data.get("accepted") is False or data.get("cancelled") is True:
                 audit("remote_result_outbox_discarded", job_id=result.get("job_id"))
+            operation = "remove acknowledged result outbox"
             await asyncio.to_thread(path.unlink, True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            delay_s = _worker_retry_delay(1)
-            _worker_log_retry("result outbox submit", exc, delay_s)
-            await asyncio.sleep(delay_s)
+            delay_s = await schedule.failed(path.name) if path is not None else 1.0
+            _worker_log_retry(operation, exc, delay_s)
+            # Per-file cooldown releases this sender immediately to other work.
+            # Only a directory-wide scan failure needs to delay the sender.
+            if path is None:
+                await asyncio.sleep(delay_s)
         finally:
-            in_progress.discard(path.name)
+            if path is not None:
+                in_progress.discard(path.name)
 
 
 @dataclass
@@ -4021,10 +4130,11 @@ async def _run_worker_locked(
     else:
         lanes = (None,)
     outbox_in_progress: set[str] = set()
+    outbox_schedule = _WorkerResultOutboxSchedule()
     sender_tasks = [
         asyncio.create_task(
             _worker_result_outbox_sender(
-                server, headers, heartbeat_interval_s, outbox_in_progress
+                server, headers, heartbeat_interval_s, outbox_in_progress, outbox_schedule
             ),
             name=f"remote-worker-result-sender-{index}",
         )
