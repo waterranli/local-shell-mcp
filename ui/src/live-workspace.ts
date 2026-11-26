@@ -51,6 +51,13 @@ class LiveApiError extends Error {
   }
 }
 
+class LiveCredentialUnavailableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "LiveCredentialUnavailableError"
+  }
+}
+
 function isLiveCredentialError(error: unknown): boolean {
   return error instanceof LiveApiError && (error.status === 401 || error.status === 403)
 }
@@ -1794,11 +1801,22 @@ async function checkPlanContinuation(): Promise<void> {
 async function runConnectionLoop(generation: number): Promise<void> {
   let attempt = 0
   let announcedRetry = false
+  let credentialStale = false
   while (!shuttingDown && config && generation === pollGeneration) {
     try {
       connectionMessage = attempt ? "Reconnecting" : "Connecting"
       updateChrome()
       renderCurrentTab()
+      if (credentialStale) {
+        const stale = config
+        await refreshLiveCredentials({
+          machine: stale.machine,
+          cwd: stale.cwd,
+          live_id: stale.liveId,
+          ...(stale.sessionId ? { session_id: stale.sessionId } : {}),
+        }, true)
+        return
+      }
       if (!await loadSnapshot(generation)) return
       await refreshAllCore()
       if (generation !== pollGeneration) return
@@ -1813,6 +1831,7 @@ async function runConnectionLoop(generation: number): Promise<void> {
       if (shuttingDown || !config || generation !== pollGeneration) return
       let error = caught
       if (isLiveCredentialError(error)) {
+        credentialStale = true
         const stale = config
         try {
           await refreshLiveCredentials({
@@ -1825,6 +1844,14 @@ async function runConnectionLoop(generation: number): Promise<void> {
         } catch (credentialError) {
           error = credentialError
         }
+      }
+      if (error instanceof LiveCredentialUnavailableError) {
+        connected = false
+        connectionMessage = "Reopen Live Workspace to reconnect"
+        updateChrome()
+        renderCurrentTab()
+        notify(error.message, "warning")
+        return
       }
       connected = false
       connectionMessage = "Reconnecting"
@@ -1970,7 +1997,7 @@ async function requestLiveConfig(structured: JsonRecord, allowCreate: boolean): 
   const token = String(hidden?.token || "")
   const apiBase = String(hidden?.apiBase || responseStructured.api_base || structured.api_base || "")
   if (!token || !apiBase) {
-    throw new Error("ChatGPT omitted Live Workspace credentials from the app-initiated tool result")
+    throw new LiveCredentialUnavailableError("ChatGPT omitted Live Workspace credentials from the app-initiated tool result")
   }
   return {
     token,
@@ -2016,6 +2043,14 @@ async function recoverCredentialsForever(structured: JsonRecord): Promise<void> 
       await refreshLiveCredentials(structured, true)
       return
     } catch (error) {
+      if (error instanceof LiveCredentialUnavailableError) {
+        connected = false
+        connectionMessage = "Reopen Live Workspace to reconnect"
+        updateChrome()
+        renderCurrentTab()
+        notify(error.message, "warning")
+        return
+      }
       connected = false
       connectionMessage = "Reconnecting"
       updateChrome()

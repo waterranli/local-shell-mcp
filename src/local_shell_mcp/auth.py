@@ -297,6 +297,8 @@ def verify_request(request: Request) -> Principal:
                 )
             if settings.auth_mode == "none":
                 raise HTTPException(status_code=401, detail="Invalid live workspace credential")
+            if token.count(".") != 2:
+                raise HTTPException(status_code=401, detail="Invalid live workspace credential")
     if settings.auth_mode == "none":
         if path.startswith((HUMAN_UI_API_PREFIX, LIVE_UI_API_PREFIX)) and _is_cross_origin_request(
             request

@@ -74,6 +74,7 @@ LIVE_EVENT_LIMIT = 2_000
 LIVE_EVENT_BATCH = 300
 LIVE_LONG_POLL_S = 25.0
 LIVE_APP_REATTACH_CLAIM_TTL_S = 2 * 60.0
+LIVE_MAX_SECONDARY_CREDENTIALS_PER_CHANNEL = 4
 
 
 @dataclass(slots=True)
@@ -150,6 +151,16 @@ class LiveChannelManager:
             "scopes": scopes,
             "expires_at": expires_at,
         }
+        if not primary:
+            secondary_digests = [
+                existing_digest
+                for existing_digest, credential in self._credentials.items()
+                if credential["live_id"] == channel.live_id
+                and existing_digest != channel.token_digest
+            ]
+            overflow = len(secondary_digests) - LIVE_MAX_SECONDARY_CREDENTIALS_PER_CHANNEL
+            for old_digest in secondary_digests[: max(0, overflow)]:
+                self._credentials.pop(old_digest, None)
         channel.expires_at = max(channel.expires_at, expires_at)
         return token
 
