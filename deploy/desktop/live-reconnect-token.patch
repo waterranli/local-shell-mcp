@@ -1,0 +1,88 @@
+diff --git a/src/local_shell_mcp/tools.py b/src/local_shell_mcp/tools.py
+index fc8a46f..89ade9e 100644
+--- a/src/local_shell_mcp/tools.py
++++ b/src/local_shell_mcp/tools.py
+@@ -279,6 +279,12 @@ class LiveChannelResult(BaseModel):
+     message: str = "Live workspace ready"
+ 
+ 
++class LiveChannelReconnectResult(LiveChannelResult):
++    """App-only reconnect result that includes a fallback live_token when hosts strip _meta."""
++
++    live_token: str | None = None
++
++
+ def _error_call_result(data: dict[str, Any], message: str) -> CallToolResult:
+     structured = {"ok": False, "message": message, "data": data}
+     return CallToolResult(
+@@ -709,6 +715,11 @@ def _safe_audit_result(tool_name: str, value: Any) -> Any:
+         return serialized
+     sanitized = dict(serialized)
+     sanitized.pop("meta", None)
++    structured = sanitized.get("structuredContent")
++    if isinstance(structured, dict) and "live_token" in structured:
++        safe_structured = dict(structured)
++        safe_structured["live_token"] = "<redacted>"
++        sanitized["structuredContent"] = safe_structured
+     return sanitized
+ 
+ 
+@@ -4815,14 +4826,25 @@ def _register_live_workspace_tools(
+                 else None
+             ),
+         )
+-        result = LiveChannelResult(
+-            live_id=channel.live_id,
+-            session_id=channel.logical_session_id,
+-            api_base=_live_workspace_api_base(),
+-            ui_path=settings.ui_path,
+-            machine=channel.machine,
+-            cwd=channel.cwd,
+-        )
++        if app_reattach:
++            result: LiveChannelResult = LiveChannelReconnectResult(
++                live_id=channel.live_id,
++                session_id=channel.logical_session_id,
++                api_base=_live_workspace_api_base(),
++                ui_path=settings.ui_path,
++                machine=channel.machine,
++                cwd=channel.cwd,
++                live_token=live_token,
++            )
++        else:
++            result = LiveChannelResult(
++                live_id=channel.live_id,
++                session_id=channel.logical_session_id,
++                api_base=_live_workspace_api_base(),
++                ui_path=settings.ui_path,
++                machine=channel.machine,
++                cwd=channel.cwd,
++            )
+         return cast(
+             LiveChannelResult,
+             CallToolResult(
+@@ -4899,14 +4921,17 @@ def _register_live_workspace_tools(
+         cwd: str = ".",
+         live_id: str | None = None,
+         session_id: str | None = None,
+-    ) -> LiveChannelResult:
++    ) -> LiveChannelReconnectResult:
+         """Internal app-only Live Workspace credential attachment endpoint."""
+-        return await build_live_channel_result(
+-            machine=machine,
+-            cwd=cwd,
+-            live_id=live_id,
+-            session_id=session_id,
+-            app_reattach=True,
++        return cast(
++            LiveChannelReconnectResult,
++            await build_live_channel_result(
++                machine=machine,
++                cwd=cwd,
++                live_id=live_id,
++                session_id=session_id,
++                app_reattach=True,
++            ),
+         )
+ 
+ 
