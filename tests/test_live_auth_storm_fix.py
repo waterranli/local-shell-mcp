@@ -4,7 +4,7 @@ from fastapi import HTTPException
 import pytest
 from starlette.requests import Request
 
-from local_shell_mcp import auth
+from local_shell_mcp import auth, tools
 from local_shell_mcp.settings import Settings
 from local_shell_mcp.live_channel import (
     LIVE_MAX_SECONDARY_CREDENTIALS_PER_CHANNEL,
@@ -90,3 +90,23 @@ def test_malformed_jwt_on_live_route_still_falls_through_to_oauth(
 
     assert exc_info.value.status_code == 401
     assert any(event == "oauth_auth_failed" for event, _ in audit_events)
+
+
+@pytest.mark.asyncio
+async def test_live_workspace_reconnect_includes_redacted_fallback_token() -> None:
+    mcp = tools.build_mcp()
+    opened = await mcp.call_tool("workspace_open", {"session_id": None, "machine": "local", "cwd": "."})
+    assert "live_token" not in (opened.structuredContent or {})
+    live_id = opened.structuredContent["live_id"]
+
+    reconnected = await mcp.call_tool(
+        "live_workspace_reconnect",
+        {"machine": "local", "cwd": ".", "live_id": live_id},
+    )
+    structured = reconnected.structuredContent or {}
+    meta_token = reconnected.meta["local-shell-mcp/live"]["token"]
+    assert structured["live_token"] == meta_token
+    assert isinstance(meta_token, str) and len(meta_token) >= 20
+
+    audited = tools._safe_audit_result("live_workspace_reconnect", reconnected)
+    assert audited["structuredContent"]["live_token"] == "<redacted>"

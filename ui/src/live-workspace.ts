@@ -1994,7 +1994,7 @@ async function requestLiveConfig(structured: JsonRecord, allowCreate: boolean): 
   }
   const responseStructured = (resolvedResponse.structuredContent || {}) as JsonRecord
   const hidden = resolvedResponse._meta?.["local-shell-mcp/live"] as JsonRecord | undefined
-  const token = String(hidden?.token || "")
+  const token = String(hidden?.token || responseStructured.live_token || "")
   const apiBase = String(hidden?.apiBase || responseStructured.api_base || structured.api_base || "")
   if (!token || !apiBase) {
     throw new LiveCredentialUnavailableError("ChatGPT omitted Live Workspace credentials from the app-initiated tool result")
